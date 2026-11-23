@@ -153,11 +153,9 @@ def cmd_list(_: argparse.Namespace) -> None:
 
 
 def cmd_remove(args: argparse.Namespace) -> None:
-    svc = _service()
-    ds = svc.ds(args.name)
-    with svc.store.tx() as con:
-        con.execute("DELETE FROM datasource WHERE id = ?", (ds["id"],))
-    print(f"Removed datasource {ds['name']} and its ontology.")
+    out = _service().remove_datasource(args.name)
+    extra = f" Removed {len(out['mirror_files'])} mirror file(s)." if out.get("mirror_files") else ""
+    print(f"Removed datasource {out['datasource']} and its ontology.{extra}")
 
 
 def cmd_export(args: argparse.Namespace) -> None:
@@ -230,7 +228,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--description", default=None)
     p.add_argument("--schemas", default=None, help="comma-separated schemas to include")
     p.add_argument("--tables", default=None, help=TABLES_HELP + " (saved with the datasource)")
-    p.add_argument("--config", default=None, help="JSON file with the endpoint config of an api:// collection")
+    p.add_argument(
+        "--config",
+        default=None,
+        help="JSON file: endpoint config for an api:// collection; for mongodb:// mirrors optionally "
+        '{"deny": [field substrings], "filters": {collection: {"match": {field: {"$regex": ..., "$options": "i"}}, '
+        '"parents": [{"of": parentCollection, "links": [{"field": fk, "parent_field": "_id"}]}]}}} '
+        "(per-document exclusions, parent-based)",
+    )
     p.add_argument("--no-scan", action="store_true")
     p.set_defaults(func=cmd_add)
 

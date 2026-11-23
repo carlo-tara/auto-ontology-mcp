@@ -244,7 +244,7 @@ def build_server(settings: Settings | None = None, service: OntologyService | No
             """Re-fetch a MongoDB mirror or an API collection into its SQLite mirror and re-scan it.
             Use it when the source data changed: mirrors are snapshots, run_sql reads the mirror,
             not the live database. For a live SQL datasource this fails; use scan_datasource.
-            The source is read only; Terms, reviewed relationships and SQL attributes are kept."""
+            The source is read only; Terms, reviewed relationships and SQL attributes are kept. The result reports filter_dropped: documents excluded per collection by config filters (also kept on the datasource), so a filtered snapshot never reads as a whole population."""
             return svc.refresh_datasource(datasource, scan)
 
     # ------------------------------------------------------------- modeling

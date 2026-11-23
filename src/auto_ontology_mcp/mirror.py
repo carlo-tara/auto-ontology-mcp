@@ -34,6 +34,7 @@ import math
 import os
 import re
 import sqlite3
+from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
@@ -181,8 +182,20 @@ def flatten_document(
     for raw_key, value in doc.items():
         if raw_key in _SKIP_KEYS:
             continue
-        # _id and id name the same anchor column; a document with both merges them.
-        key = "id" if raw_key in ("_id", "id") else sanitize_key(raw_key)
+        # _id is the anchor; a document's own id joins it only when identical, else the
+        # legacy value survives under "legacy_id": merging would crash the PK on duplicate
+        # legacy ids and null out the anchor when the id field is absent-valued.
+        if raw_key == "_id":
+            key = "id"
+        elif raw_key == "id":
+            if row_key is None:
+                key = "id"
+            elif str(coerce_value(value)[1]) == row_key:
+                key = "id"
+            else:
+                key = "legacy_id"
+        else:
+            key = sanitize_key(raw_key)
         if _denied(key, deny):
             continue
         if (
@@ -285,13 +298,242 @@ def mongo_source_names(client: Any, database: str) -> list[str]:
     return sorted(n for n in names if not n.startswith("system."))
 
 
-def mongo_sources(client: Any, database: str, collections: list[str]) -> Iterator[tuple[str, Iterable[dict[str, Any]]]]:
+def mongo_sources(
+    client: Any,
+    database: str,
+    collections: list[str],
+    filters: dict[str, Any] | None = None,
+    dropped: dict[str, int] | None = None,
+) -> Iterator[tuple[str, Iterable[dict[str, Any]]]]:
     db = client[database]
+    if not filters:
+        for name in collections:
+            yield name, db[name].find({})
+        return
+    cache: dict[str, dict[str, set[str]]] = {}
+
+    def parent_values(of: str) -> dict[str, set[str]]:
+        if of not in cache:
+            want = _wanted_parent_fields(filters).get(of, set())
+            sets = {f: set() for f in want}
+            projection = {f: 1 for f in want} or None
+            for doc in db[of].find(filters[of]["match"], projection):
+                for f in want:
+                    v = doc.get(f)
+                    if v is not None:
+                        sets[f].add(str(v))
+            cache[of] = sets
+        return cache[of]
+
+    def keep(name: str, doc: dict[str, Any]) -> bool:
+        spec = filters.get(name)
+        if not spec:
+            return True
+        drop = ("match" in spec and _match_doc(doc, spec["match"])) or any(
+            doc.get(link["field"]) is not None
+            and str(doc.get(link["field"])) in parent_values(p["of"]).get(link["parent_field"], set())
+            for p in spec.get("parents", [])
+            for link in p["links"]
+        )
+        if drop and dropped is not None:
+            dropped[name] = dropped.get(name, 0) + 1
+        return not drop
+
     for name in collections:
-        yield name, db[name].find({})
+        yield name, (d for d in db[name].find({}) if keep(name, d))
+
+
+# ------------------------------------------------------------------ document filters
+# Policy rules of the "internal accounts never appear in an analysis" kind are per-document
+# and parent-based: a child document must go when the parent it references is excluded.
+# `match` is a subset of the Mongo query language (bare equality, $regex/$options, $in/$nin,
+# $ne/$eq, $exists) that is valid both as a pymongo query and in the client-side _match_doc,
+# so parent key-sets are computed at the source. Unknown operators fail loudly: a security
+# filter that silently matches nothing is worse than no migration.
+_FILTER_OPS = frozenset({"$regex", "$options", "$in", "$nin", "$ne", "$eq", "$exists"})
+
+
+def _regex_flags(options: Any) -> int:
+    flags = 0
+    for ch in str(options or ""):
+        if ch == "i":
+            flags |= re.IGNORECASE
+        elif ch == "s":
+            flags |= re.DOTALL
+        elif ch == "m":
+            flags |= re.MULTILINE
+        elif ch == "x":
+            flags |= re.VERBOSE
+        else:
+            raise OntologyError(f"filter $options: unsupported flag {ch!r}.")
+    return flags
+
+
+def _validate_match(query: Any, where: str) -> dict[str, Any]:
+    if not isinstance(query, dict) or not query:
+        raise OntologyError(f"{where}: 'match' needs a non-empty object of field conditions.")
+    for field, cond in query.items():
+        if str(field).startswith("$"):
+            raise OntologyError(f"{where}: top-level operators are not supported; use field conditions.")
+        if isinstance(cond, dict):
+            bare = {op for op in cond if not str(op).startswith("$")}
+            if bare:
+                raise OntologyError(f"{where}: condition on {field!r} mixes bare keys with operators: {sorted(bare)}.")
+            unknown = {op for op in cond if op not in _FILTER_OPS}
+            if unknown:
+                raise OntologyError(f"{where}: unsupported operator(s) {sorted(unknown)} on {field!r} (supported: {sorted(_FILTER_OPS)}).")
+            if "$regex" in cond and not isinstance(cond["$regex"], str):
+                raise OntologyError(f"{where}: $regex on {field!r} needs a string pattern.")
+        elif isinstance(cond, (list, tuple)):
+            raise OntologyError(f"{where}: bare equality on {field!r} needs a scalar.")
+    return {str(k): v for k, v in query.items()}
+
+
+def _match_doc(doc: dict[str, Any], query: dict[str, Any]) -> bool:
+    """Client-side evaluation of the subset accepted by _validate_match."""
+    for field, cond in query.items():
+        value = doc.get(field)
+        if isinstance(cond, dict):
+            for op, arg in cond.items():
+                if op == "$regex":
+                    if not isinstance(value, str) or not re.search(arg, value, _regex_flags(cond.get("$options"))):
+                        return False
+                elif op == "$options":
+                    continue
+                elif op in ("$in", "$nin"):
+                    members = {str(a) for a in arg}
+                    hit = value is not None and str(value) in members
+                    if hit == (op == "$nin"):
+                        return False
+                elif op in ("$ne", "$eq"):
+                    hit = value is not None and str(value) == str(arg)
+                    if hit == (op == "$ne"):
+                        return False
+                elif op == "$exists":
+                    if (value is not None) != bool(arg):
+                        return False
+        else:
+            if value is None or str(value) != str(cond):
+                return False
+    return True
+
+
+def validate_doc_filters(filters: Any, datasource: str) -> dict[str, dict[str, Any]]:
+    """Validate {name: {"match"?: query, "parents"?: [{"of", "links": [{"field", "parent_field"}]}]}}."""
+    if not isinstance(filters, dict) or not filters:
+        raise OntologyError(f"filters of {datasource!r} must be a non-empty object keyed by collection/endpoint name.")
+    out: dict[str, dict[str, Any]] = {}
+    for name, spec in filters.items():
+        where = f"Filter on {str(name)!r} of {datasource!r}"
+        if not isinstance(spec, dict):
+            raise OntologyError(f"{where}: expected an object with 'match' and/or 'parents'.")
+        unknown = {k for k in spec if k not in {"match", "parents"}}
+        if unknown:
+            raise OntologyError(f"{where}: unknown keys {sorted(unknown)}.")
+        clean: dict[str, Any] = {}
+        if "match" in spec:
+            clean["match"] = _validate_match(spec["match"], where)
+        parents: list[dict[str, Any]] = []
+        for p in spec.get("parents") or []:
+            if not isinstance(p, dict) or not p.get("of"):
+                raise OntologyError(f"{where}: each 'parents' entry needs an 'of' naming the parent collection/endpoint.")
+            of = str(p["of"])
+            parent_spec = filters.get(of)
+            if not isinstance(parent_spec, dict) or "match" not in parent_spec:
+                raise OntologyError(
+                    f"{where}: parent {of!r} has no 'match', so nothing could ever be excluded through it "
+                    "(fail-safe: refusing a filter that drops nothing)."
+                )
+            links = p.get("links")
+            if not isinstance(links, list) or not links:
+                raise OntologyError(f"{where}: parent {of!r} needs a non-empty 'links' list: [{{'field', 'parent_field'}}].")
+            clean_links = []
+            for link in links:
+                if not isinstance(link, dict) or not link.get("field"):
+                    raise OntologyError(f"{where}: a link of parent {of!r} needs a 'field' (the child's reference field).")
+                clean_links.append({"field": str(link["field"]), "parent_field": str(link.get("parent_field") or "_id")})
+            parents.append({"of": of, "links": clean_links})
+        if parents:
+            clean["parents"] = parents
+        if not clean:
+            raise OntologyError(f"{where}: needs 'match' and/or 'parents'.")
+        out[str(name)] = clean
+    return out
+
+
+def _wanted_parent_fields(filters: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
+    fields: dict[str, set[str]] = defaultdict(set)
+    for spec in filters.values():
+        for p in spec.get("parents", []):
+            for link in p["links"]:
+                fields[p["of"]].add(link["parent_field"])
+    return fields
+
+
+def validate_mongo_config(config: Any, datasource: str) -> dict[str, Any]:
+    """Mirror options of a MongoDB datasource: {"deny": [...], "filters": {...}}."""
+    if not isinstance(config, dict):
+        raise OntologyError(f"The config of {datasource!r} must be an object (keys: 'deny', 'filters').")
+    unknown = {k for k in config if k not in {"deny", "filters"}}
+    if unknown:
+        raise OntologyError(
+            f"The config of {datasource!r} has unknown keys {sorted(unknown)}; "
+            "a MongoDB mirror takes 'deny' (extra field substrings) and 'filters' (per-document exclusions)."
+        )
+    out: dict[str, Any] = {}
+    if config.get("deny") is not None:
+        deny = config["deny"]
+        if not isinstance(deny, list) or not all(isinstance(d, str) for d in deny):
+            raise OntologyError(f"config['deny'] of {datasource!r} must be a list of field-name substrings.")
+        out["deny"] = deny
+    if config.get("filters") is not None:
+        out["filters"] = validate_doc_filters(config["filters"], datasource)
+    return out
 
 
 # ------------------------------------------------------------------ API collections
+def api_filtered_sources(
+    sources: list[tuple[str, list[dict[str, Any]]]],
+    filters: dict[str, Any] | None,
+    dropped: dict[str, int] | None = None,
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Apply document filters to fetched endpoint lists (see validate_doc_filters)."""
+    if not filters:
+        return sources
+    items = dict(sources)
+    cache: dict[str, dict[str, set[str]]] = {}
+
+    def parent_values(of: str) -> dict[str, set[str]]:
+        if of not in cache:
+            want = _wanted_parent_fields(filters).get(of, set())
+            query = filters[of]["match"]
+            sets = {f: set() for f in want}
+            for doc in items.get(of, []):
+                if _match_doc(doc, query):
+                    for f in want:
+                        v = doc.get(f)
+                        if v is not None:
+                            sets[f].add(str(v))
+            cache[of] = sets
+        return cache[of]
+
+    def keep(name: str, doc: dict[str, Any]) -> bool:
+        spec = filters.get(name)
+        if not spec:
+            return True
+        drop = ("match" in spec and _match_doc(doc, spec["match"])) or any(
+            doc.get(link["field"]) is not None
+            and str(doc.get(link["field"])) in parent_values(p["of"]).get(link["parent_field"], set())
+            for p in spec.get("parents", [])
+            for link in p["links"]
+        )
+        if drop and dropped is not None:
+            dropped[name] = dropped.get(name, 0) + 1
+        return not drop
+
+    return [(name, [d for d in docs if keep(name, d)]) for name, docs in sources]
+
+
 def api_sources(config: dict[str, Any], timeout_s: int) -> Iterator[tuple[str, list[dict[str, Any]]]]:
     """Fetch every endpoint of an API collection; yields (name, docs).
 
@@ -376,13 +618,14 @@ def _fetch_endpoint(client: Any, ep: dict[str, Any], base: str, default_headers:
 
 
 def source_type_of(url: str | None, config: dict[str, Any] | None) -> str:
-    """database (SQLAlchemy), mongo (mongodb:// URL) or api (endpoint config)."""
-    if config is not None:
-        return "api"
+    """database (SQLAlchemy), mongo (mongodb:// URL) or api (endpoint config).
+
+    The URL wins over the presence of a config: a mongodb:// URL may carry a config with
+    mirror options (deny, filters), and only api:// / bare names rely on the config."""
     low = (url or "").strip().lower()
     if low.startswith(("mongodb://", "mongodb+srv://")):
         return "mongo"
-    if low.startswith("api://"):
+    if config is not None or low.startswith("api://"):
         return "api"
     return "database"
 
@@ -417,6 +660,7 @@ def validate_api_config(config: Any, datasource: str) -> dict[str, Any]:
     return {
         "base_url": str(config.get("base_url") or ""),
         "headers": config.get("headers") or {},
+        "filters": validate_doc_filters(config["filters"], datasource) if config.get("filters") is not None else None,
         "endpoints": clean,
         **({"deny": list(deny)} if deny else {}),
     }

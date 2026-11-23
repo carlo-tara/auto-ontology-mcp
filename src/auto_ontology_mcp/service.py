@@ -221,7 +221,15 @@ class OntologyService:
             out.append(
                 {
                     "datasource": ds["name"],
-                    **({"source_type": kind, "materialized_at": ds.get("materialized_at")} if kind else {}),
+                    **(
+                        {
+                            "source_type": kind,
+                            "materialized_at": ds.get("materialized_at"),
+                            "filter_dropped": (ds.get("refresh_info") or {}).get("dropped") or {},
+                        }
+                        if kind
+                        else {}
+                    ),
                     "dialect": ds.get("dialect"),
                     "url": mask_url(ds["url"]),
                     "description": ds.get("description"),
@@ -324,6 +332,8 @@ class OntologyService:
     ) -> dict[str, Any]:
         if source_type == "mongo":
             source_config = mirror.mongo_config(url)
+            if config:
+                source_config.update(mirror.validate_mongo_config(config, name))
         elif config is None:
             raise OntologyError("An api:// datasource needs the endpoint config; pass it in `config`.")
         else:
@@ -373,27 +383,28 @@ class OntologyService:
     def _mirror_exists(self, ds: dict[str, Any]) -> bool:
         return bool(ds.get("mirror_url")) and self._mirror_path(ds).exists()
 
-    def _materialize(self, ds: dict[str, Any]) -> dict[str, int]:
+    def _materialize(self, ds: dict[str, Any]) -> tuple[dict[str, int], dict[str, int]]:
         """Fetch every document from the source and rewrite the local SQLite mirror atomically."""
         kind = ds.get("source_type")
         cfg = ds.get("source_config") or {}
         tf = TableFilter.parse(ds.get("table_filter"))
         deny = cfg.get("deny")
+        dropped: dict[str, int] = {}
         if kind == "mongo":
             client = mirror.mongo_connect(cfg["url"], self.settings.query_timeout_s)
             try:
                 names = mirror.mongo_source_names(client, cfg["database"])
                 if tf is not None:
                     names = [n for n in names if tf.matches("", n)]
-                builders = mirror.materialize(mirror.mongo_sources(client, cfg["database"], names), deny=deny)
+                builders = mirror.materialize(mirror.mongo_sources(client, cfg["database"], names, cfg.get("filters"), dropped), deny=deny)
             finally:
                 close = getattr(client, "close", None)
                 if callable(close):
                     close()
         elif kind == "api":
             endpoints = [e for e in cfg.get("endpoints") or [] if tf is None or tf.matches("", e["name"])]
-            sources = mirror.api_sources({**cfg, "endpoints": endpoints}, self.settings.query_timeout_s)
-            builders = mirror.materialize(sources, deny=deny)
+            sources = list(mirror.api_sources({**cfg, "endpoints": endpoints}, self.settings.query_timeout_s))
+            builders = mirror.materialize(mirror.api_filtered_sources(sources, cfg.get("filters"), dropped), deny=deny)
         else:
             raise OntologyError(f"{ds['name']} is not a document datasource; only MongoDB and API mirrors re-fetch.")
         try:
@@ -401,12 +412,25 @@ class OntologyService:
         except OSError as exc:
             raise OntologyError(f"Could not write the mirror file: {short_error(exc)}") from exc
         self.connections.forget(ds["id"])
+        # Provenienza del filtro: quanti documenti sono stati esclusi, per collection.
+        # Un refresh senza filtri azzera il campo: lo specchio non deve "credersi" filtrato
+        # quando la policy è stata rimossa dal config.
+        refresh_info = (
+            {"dropped": dict(sorted(dropped.items())), "dropped_total": sum(dropped.values())}
+            if cfg.get("filters")
+            else None
+        )
         self.store.update(
             "datasource",
             ds["id"],
-            {"mirror_url": f"sqlite:///{self._mirror_path(ds)}", "dialect": "sqlite", "materialized_at": now()},
+            {
+                "mirror_url": f"sqlite:///{self._mirror_path(ds)}",
+                "dialect": "sqlite",
+                "materialized_at": now(),
+                "refresh_info": refresh_info,
+            },
         )
-        return counts
+        return counts, dropped
 
     def refresh_datasource(self, datasource: str | None = None, scan: bool = True) -> dict[str, Any]:
         """Re-fetch a MongoDB / API-collection source into its SQLite mirror, then re-scan it."""
@@ -416,7 +440,7 @@ class OntologyService:
                 f"'{ds['name']}' is a live SQL database ({mask_url(ds['url'])}); use scan_datasource to re-read it."
             )
         try:
-            counts = self._materialize(ds)
+            counts, dropped = self._materialize(ds)
         except OntologyError:
             raise
         except Exception as exc:  # noqa: BLE001 - driver errors read as transport noise
@@ -431,6 +455,7 @@ class OntologyService:
             "materialized_at": ds["materialized_at"],
             "tables": counts,
             "rows": sum(counts.values()),
+            "filter_dropped": dict(sorted(dropped.items())),
         }
         if scan:
             result["scan"] = self.scan_datasource(ds["name"])
@@ -438,6 +463,25 @@ class OntologyService:
         else:
             result["next_step"] = "Call scan_datasource to refresh the catalog and profiles."
         return result
+
+    def remove_datasource(self, datasource: str) -> dict[str, Any]:
+        """Delete a datasource and its ontology; for document sources also unlink the mirror files."""
+        ds = self.ds(datasource)
+        with self.store.tx() as con:
+            con.execute("DELETE FROM datasource WHERE id = ?", (ds["id"],))
+        self.connections.forget(ds["id"])
+        files: list[str] = []
+        if ds.get("source_type") in ("mongo", "api"):
+            base = self._mirror_path(ds)
+            for cand in (base, Path(str(base) + "-wal"), Path(str(base) + "-shm"), Path(str(base) + ".tmp")):
+                try:
+                    if cand.exists():
+                        cand.unlink()
+                        files.append(str(cand))
+                except OSError as exc:
+                    files.append(f"{cand} (not removed: {exc})")
+        self.store.log("datasource", ds["id"], "delete", {"name": ds["name"], "mirror_files": files})
+        return {"datasource": ds["name"], "removed": True, "mirror_files": files}
 
     def _table_filter(self, ds: dict[str, Any], tables: list[str] | None) -> tuple[TableFilter | None, str | None]:
         """The scan's table filter and where it came from: the call, the datasource or the environment."""

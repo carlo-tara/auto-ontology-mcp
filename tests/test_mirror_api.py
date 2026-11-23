@@ -139,3 +139,23 @@ def test_http_error_surfaces(settings, api_server):
     svc.add_datasource("z", "api://z", scan=False, config={"endpoints": [{"name": "bad", "url": api_server + "/nope"}]})
     with pytest.raises(OntologyError, match="HTTP 404"):
         svc.refresh_datasource("z", scan=False)
+
+
+def test_api_filters_drop_documents(settings, api_server):
+    """Document filters on endpoints: self-match exclusion, like the Mongo mirror."""
+    from auto_ontology_mcp.service import OntologyService
+
+    svc = OntologyService(settings)
+    svc.add_datasource(
+        "af",
+        "api://af",
+        scan=False,
+        config={
+            "endpoints": [{"name": "orders", "url": api_server + "/orders", "items_path": "data.rows"}],
+            "filters": {"orders": {"match": {"email": {"$regex": "^b@"}}}},
+        },
+    )
+    out = svc.refresh_datasource("af")
+    rows = svc.run_sql("SELECT id FROM orders ORDER BY id")["rows"]
+    assert [r[0] for r in rows] == [100]
+    assert out["filter_dropped"] == {"orders": 1}

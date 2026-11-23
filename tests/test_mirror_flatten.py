@@ -128,3 +128,23 @@ def test_validate_api_config():
         mirror.validate_api_config(
             {"endpoints": [{"name": "a", "url": "u"}, {"name": "a", "url": "v"}]}, "crm"
         )
+
+
+def test_id_and_underscore_id_keep_the_anchor():
+    """A document with both _id and a differing id: _id is the anchor, id survives as legacy_id
+    (merging them would crash the PK on duplicate legacy ids — real-world investorclubsubscriptions)."""
+    builders: dict[str, mirror.TableBuilder] = {}
+    mirror.flatten_document("subs", {"_id": "a1", "id": 7, "n": 1}, builders)
+    mirror.flatten_document("subs", {"_id": "a2", "id": 7, "n": 2}, builders)
+    b = builders["subs"]
+    assert b.spec[1] == ["id"]
+    assert [r["id"] for r in b.rows] == ["a1", "a2"]
+    assert [r["legacy_id"] for r in b.rows] == [7, 7]
+    # identical id/_id merge into one column (no legacy_id)
+    builders2: dict[str, mirror.TableBuilder] = {}
+    mirror.flatten_document("x", {"_id": "k", "id": "k"}, builders2)
+    assert "legacy_id" not in builders2["x"].columns
+    # id-only documents still use it as the anchor
+    builders3: dict[str, mirror.TableBuilder] = {}
+    mirror.flatten_document("y", {"id": 3, "v": "z"}, builders3)
+    assert builders3["y"].rows[0]["id"] == 3

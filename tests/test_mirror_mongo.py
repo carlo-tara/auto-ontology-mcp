@@ -14,8 +14,12 @@ class FakeCollection:
     def __init__(self, docs: list[dict]) -> None:
         self.docs = docs
 
-    def find(self, _filter: dict) -> list[dict]:
-        return self.docs
+    def find(self, _filter: dict | None = None, _projection: dict | None = None) -> list[dict]:
+        out = [d for d in self.docs if not _filter or mirror._match_doc(d, _filter)]
+        if _projection:
+            keys = {"_id", *_projection}
+            out = [{k: v for k, v in d.items() if k in keys} for d in out]
+        return out
 
 
 class FakeDB:
@@ -163,3 +167,88 @@ def test_bad_mongo_urls_rejected(settings):
     svc = OntologyService(settings)
     with pytest.raises(OntologyError, match="name the database"):
         svc.add_datasource("m", "mongodb://hostonly/", scan=False)
+
+
+def test_mongo_filters_exclude_internal_parents_and_their_documents(settings, fake_mongo):
+    from auto_ontology_mcp.service import OntologyService
+
+    # an "internal account" like AGENTS.md's @moneysurfers.com rule: the user, its tx by
+    # ObjectId link, and a tx whose denormalized email matches even without a user link.
+    fake_mongo[0]["db"]["users"].append({"_id": "u9", "name": "Internal", "email": "staff@evil.example"})
+    fake_mongo[0]["db"]["transactions"].append({"_id": "t9", "user": "u9", "finalTotal": 10.0, "status": 2, "products": []})
+    fake_mongo[0]["db"]["transactions"].append({"_id": "t8", "finalTotal": 20.0, "status": 2, "email": "staff@evil.example", "products": []})
+    filters = {
+        "users": {"match": {"email": {"$regex": "@evil\\.example$", "$options": "i"}}},
+        "transactions": {
+            "match": {"email": {"$regex": "@evil\\.example$", "$options": "i"}},
+            "parents": [{"of": "users", "links": [{"field": "user", "parent_field": "_id"}]}],
+        },
+    }
+    svc = OntologyService(settings)
+    res = svc.add_datasource("mf", "mongodb://h/db", scan=False, config={"filters": filters})
+    assert res["source_type"] == "mongo"
+    ds = svc.ds("mf")
+    assert ds["source_config"]["filters"]["transactions"]["parents"][0]["of"] == "users"
+    out = svc.refresh_datasource("mf")
+    ids = [r[0] for r in svc.run_sql("SELECT id FROM users ORDER BY id")["rows"]]
+    assert ids == ["u1", "u2"]
+    tids = [r[0] for r in svc.run_sql("SELECT id FROM transactions ORDER BY id")["rows"]]
+    assert tids == ["t1", "t2"]
+
+    # provenance: il refresh riporta i documenti esclusi per collection e li persiste
+    assert out["filter_dropped"] == {"users": 1, "transactions": 2}
+    ds = svc.ds("mf")
+    assert ds["refresh_info"]["dropped"] == {"users": 1, "transactions": 2}
+    assert ds["refresh_info"]["dropped_total"] == 3
+    entry = next(d for d in svc.check_readiness()["datasources"] if d["datasource"] == "mf")
+    assert entry["filter_dropped"] == {"users": 1, "transactions": 2}
+
+
+def test_remove_deletes_mirror_files(settings, fake_mongo):
+    """cmd_remove lasciava orfano il file mirror (645MB reali osservati): remove_datasource lo unlinka."""
+    from auto_ontology_mcp.service import OntologyService
+
+    svc = OntologyService(settings)
+    svc.add_datasource("mf", "mongodb://h/db", scan=False)
+    svc.refresh_datasource("mf")
+    ds = svc.ds("mf")
+    path = svc._mirror_path(ds)
+    assert path.exists()
+    out = svc.remove_datasource("mf")
+    assert not path.exists()
+    assert str(path) in out["mirror_files"]
+    assert svc.store.datasource_by_name("mf") is None
+
+
+def test_mongo_filters_support_numeric_legacy_parent_keys(settings, fake_mongo):
+    from auto_ontology_mcp.service import OntologyService
+
+    fake_mongo[0]["db"]["users"].append({"_id": "u9", "userId": 77, "email": "staff@evil.example"})
+    fake_mongo[0]["db"]["accounts"] = [{"_id": "a1", "userId": 77, "label": "internal"}, {"_id": "a2", "userId": 5, "label": "kept"}]
+    filters = {
+        "users": {"match": {"email": {"$regex": "@evil\\.example$"}}},
+        "accounts": {"parents": [{"of": "users", "links": [{"field": "userId", "parent_field": "userId"}]}]},
+    }
+    svc = OntologyService(settings)
+    svc.add_datasource("mf", "mongodb://h/db", scan=False, config={"filters": filters})
+    svc.refresh_datasource("mf")
+    rows = svc.run_sql("SELECT label FROM accounts ORDER BY label")["rows"]
+    assert [r[0] for r in rows] == ["kept"]
+
+
+def test_mongo_filters_fail_loudly(settings, fake_mongo):
+    from auto_ontology_mcp.service import OntologyService
+
+    svc = OntologyService(settings)
+    with pytest.raises(OntologyError, match="no 'match'"):
+        svc.add_datasource("mf", "mongodb://h/db", scan=False, config={"filters": {
+            "transactions": {"parents": [{"of": "users", "links": [{"field": "user"}]}]},
+        }})
+    with pytest.raises(OntologyError, match="unsupported operator"):
+        svc.add_datasource("mf", "mongodb://h/db", scan=False, config={"filters": {
+            "users": {"match": {"email": {"$regexx": "x"}}},
+        }})
+    with pytest.raises(OntologyError, match="top-level"):
+        svc.add_datasource("mf", "mongodb://h/db", scan=False, config={"filters": {
+            "users": {"match": {"$or": []}},
+        }})
