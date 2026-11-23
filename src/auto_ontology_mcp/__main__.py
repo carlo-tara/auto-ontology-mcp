@@ -130,11 +130,18 @@ def cmd_add(args: argparse.Namespace) -> None:
     svc = _service()
     schemas = [s.strip() for s in args.schemas.split(",")] if args.schemas else None
     tables = _split(args.tables)
-    _print(svc.add_datasource(args.name, args.url, args.description, schemas, scan=not args.no_scan, tables=tables))
+    config = None
+    if args.config:
+        config = json.loads(Path(args.config).expanduser().read_text())
+    _print(svc.add_datasource(args.name, args.url, args.description, schemas, scan=not args.no_scan, tables=tables, config=config))
 
 
 def cmd_scan(args: argparse.Namespace) -> None:
     _print(_service().scan_datasource(args.name, profile=not args.no_profile, tables=_split(args.tables)))
+
+
+def cmd_refresh(args: argparse.Namespace) -> None:
+    _print(_service().refresh_datasource(args.name, scan=not args.no_scan))
 
 
 def _split(raw: str | None) -> list[str] | None:
@@ -219,10 +226,11 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser("add", help="register a datasource and scan it")
     p.add_argument("name")
-    p.add_argument("url", help="SQLAlchemy URL")
+    p.add_argument("url", help="SQLAlchemy URL, a mongodb:// (or mongodb+srv://) URL, or api://<name>")
     p.add_argument("--description", default=None)
     p.add_argument("--schemas", default=None, help="comma-separated schemas to include")
     p.add_argument("--tables", default=None, help=TABLES_HELP + " (saved with the datasource)")
+    p.add_argument("--config", default=None, help="JSON file with the endpoint config of an api:// collection")
     p.add_argument("--no-scan", action="store_true")
     p.set_defaults(func=cmd_add)
 
@@ -231,6 +239,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--no-profile", action="store_true")
     p.add_argument("--tables", default=None, help=TABLES_HELP + " (this scan only)")
     p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser("refresh", help="re-fetch a MongoDB or API mirror and re-scan it")
+    p.add_argument("name")
+    p.add_argument("--no-scan", action="store_true", help="refetch the mirror only; re-scan later")
+    p.set_defaults(func=cmd_refresh)
 
     p = sub.add_parser("list", help="show datasources and readiness")
     p.set_defaults(func=cmd_list)

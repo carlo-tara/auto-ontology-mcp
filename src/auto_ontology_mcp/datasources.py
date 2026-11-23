@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import decimal
+import re
 import threading
 import uuid
 from dataclasses import dataclass
@@ -78,8 +79,9 @@ def normalize_url(url: str) -> str:
 def mask_url(url: str) -> str:
     try:
         return make_url(url).render_as_string(hide_password=True)
-    except Exception:
-        return "<unparseable url>"
+    except Exception:  # noqa: BLE001 - any parse failure falls back to the regex
+        # Not a SQLAlchemy URL (mongodb://, api://...): hide the password position by hand.
+        return re.sub(r"(://[^/:@]*?:)[^@/]*(@)", r"\1***\2", url)
 
 
 # Backends whose scan covers only the connection's default schema unless schemas are named.
@@ -260,7 +262,9 @@ class Connections:
         with self._lock:
             engine = self._engines.get(key)
             if engine is None:
-                engine = _readonly_engine(datasource["url"], self.timeout_s, self.oracle_client_lib)
+                # Document mirrors (MongoDB, API collections) execute against their local
+                # SQLite file; the datasource's own url stays the source's connection string.
+                engine = _readonly_engine(datasource.get("mirror_url") or datasource["url"], self.timeout_s, self.oracle_client_lib)
                 self._engines[key] = engine
             return engine
 

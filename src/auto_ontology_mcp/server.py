@@ -133,8 +133,9 @@ TOOL_GROUPS: dict[str, str] = {
         "answer",
     ),
     **dict.fromkeys(
-        ["add_datasource", "scan_datasource", "get_modeling_worklist", "save_table_terms", "list_relationships",
-         "set_relationship", "suggest_sql_attributes", "save_sql_attribute", "update_term", "save_glossary"],
+        ["add_datasource", "scan_datasource", "refresh_datasource", "get_modeling_worklist", "save_table_terms",
+         "list_relationships", "set_relationship", "suggest_sql_attributes", "save_sql_attribute", "update_term",
+         "save_glossary"],
         "model",
     ),
     **dict.fromkeys(
@@ -183,20 +184,41 @@ def build_server(settings: Settings | None = None, service: OntologyService | No
                 Field(
                     description="SQLAlchemy URL, e.g. sqlite:////abs/path/file.db, "
                     "postgresql+psycopg://user:pass@host:5432/db, mysql+pymysql://user:pass@host/db, duckdb:///file.duckdb, "
-                    "oracle+oracledb://user:pass@host:1521/?service_name=ORCLPDB1."
+                    "oracle+oracledb://user:pass@host:1521/?service_name=ORCLPDB1. "
+                    "A mongodb:// or mongodb+srv:// URL registers a MongoDB mirror instead; "
+                    "see the config argument for HTTP API collections."
                 ),
             ],
             description: Annotated[str | None, Field(description="What this database holds.")] = None,
             schemas: Annotated[list[str] | None, Field(description="Schemas to include (default: all non-system schemas).")] = None,
             scan: Annotated[bool, Field(description="Scan the schema right away.")] = True,
             tables: Annotated[list[str] | None, Field(description=TABLES_ARG + " Saved with the datasource for later scans.")] = None,
+            config: Annotated[
+                dict | None,
+                Field(
+                    description="Only for HTTP API collections (url 'api://<name>'): "
+                    "{'base_url'?, 'headers'?: {'Authorization': 'env:HUBSPOT_TOKEN'}, 'deny'?: [field substrings], "
+                    "'endpoints': [{'name': 'deals', 'url'?, 'path'?, 'items_path': 'results', "
+                    "'pagination': {'type': 'none' | 'page', 'param': 'offset', 'size_param': 'limit', 'size': 100} | "
+                    "{'type': 'cursor', 'next_path': 'paging.after'}}]}. Each endpoint becomes a table."
+                ),
+            ] = None,
         ) -> dict[str, Any]:
             """Register a database by SQLAlchemy URL, test the connection and, by default, scan it. Use it only
             when the user gives you a URL; never invent credentials. Connections are opened
             read-only and nothing is ever written to the database. Re-using a name replaces that
             datasource's URL. Fails with the driver or connection error if the database cannot
-            be reached; use scan_datasource to re-read one that is already registered."""
-            return svc.add_datasource(name, url, description, schemas, scan, tables)
+            be reached; use scan_datasource to re-read one that is already registered.
+
+            MongoDB URLs (mongodb://, mongodb+srv://) and API collections (url api://<name> with a
+            config of endpoints) have no SQL, so they are mirrored: every collection or endpoint
+            is fetched and flattened into a local SQLite mirror, and the whole pipeline — scan,
+            profile, joins, validate_sql, run_sql — then reads the mirror, never the source
+            directly. Credential-shaped fields are dropped by name. Adding a mirror does not fetch
+            (a fetch reads every document and can take minutes): the first scan_datasource fetches
+            it, and refresh_datasource re-fetches. The mirror is a snapshot; answers reflect the
+            data as of the last fetch."""
+            return svc.add_datasource(name, url, description, schemas, scan, tables, config)
 
         @tool(WRITE)
         def scan_datasource(
@@ -213,6 +235,17 @@ def build_server(settings: Settings | None = None, service: OntologyService | No
             Reports new tables and columns added to modeled tables; get_modeling_worklist returns
             both. Reads the database only."""
             return svc.scan_datasource(datasource, schemas, profile, tables)
+
+        @tool(WRITE)
+        def refresh_datasource(
+            datasource: DatasourceArg = None,
+            scan: Annotated[bool, Field(description="Re-scan the mirror right away (profiles and inferred joins come with it).")] = True,
+        ) -> dict[str, Any]:
+            """Re-fetch a MongoDB mirror or an API collection into its SQLite mirror and re-scan it.
+            Use it when the source data changed: mirrors are snapshots, run_sql reads the mirror,
+            not the live database. For a live SQL datasource this fails; use scan_datasource.
+            The source is read only; Terms, reviewed relationships and SQL attributes are kept."""
+            return svc.refresh_datasource(datasource, scan)
 
     # ------------------------------------------------------------- modeling
     @tool(READ)

@@ -41,6 +41,8 @@ with update_term(status="certified"). After a schema change, scan_datasource aga
 reviewed joins are kept, and get_modeling_worklist returns new tables and modeled tables that \
 gained columns (send their current_terms back with the new columns placed).
 
+MongoDB URLs and api:// collections are mirrored: add_datasource only registers; the first scan_datasource fetches the mirror (it can take minutes) and refresh_datasource re-fetches it. SQL then reads the mirror snapshot, so answers are as of the last fetch.
+
 """
 _KNOWLEDGE = """\
 Keeping personal knowledge (datasource "knowledge", created on first use): when the user shares \

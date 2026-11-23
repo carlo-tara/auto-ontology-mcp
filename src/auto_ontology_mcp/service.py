@@ -8,12 +8,13 @@ from __future__ import annotations
 import difflib
 import json
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 import yaml
 from sqlglot import exp
 
-from . import __version__, guidance
+from . import __version__, guidance, mirror
 from .catalog import Scanner, TableFilter
 from .config import Settings, split_patterns
 from .datasources import (
@@ -150,6 +151,34 @@ class OntologyService:
     def check_readiness(self) -> dict[str, Any]:
         out = []
         for ds in self.store.datasources():
+            kind = ds.get("source_type")
+            if kind in ("mongo", "api") and not self._mirror_exists(ds):
+                out.append(
+                    {
+                        "datasource": ds["name"],
+                        "source_type": kind,
+                        "dialect": ds.get("dialect"),
+                        "url": mask_url(ds["url"]),
+                        "description": ds.get("description"),
+                        "can_execute_sql": False,
+                        "connection_error": None,
+                        "scanned_at": ds.get("scanned_at"),
+                        "materialized_at": None,
+                        "tables": 0,
+                        "modeled_tables": 0,
+                        "tables_without_terms": [],
+                        "tables_with_new_columns": [],
+                        "terms": {"total": 0, "certified": 0},
+                        "relationships": {"accepted": 0, "proposed": 0},
+                        "sql_attributes": 0,
+                        "example_queries": 0,
+                        "verdict": "not_materialized",
+                        "next_step": (
+                            "Call scan_datasource (first scan fetches the mirror) or refresh_datasource to fetch it."
+                        ),
+                    }
+                )
+                continue
             ok, err = self.connections.test(ds)
             tables = self.store.tables(ds["id"])
             terms = self.store.terms(ds["id"])
@@ -192,6 +221,7 @@ class OntologyService:
             out.append(
                 {
                     "datasource": ds["name"],
+                    **({"source_type": kind, "materialized_at": ds.get("materialized_at")} if kind else {}),
                     "dialect": ds.get("dialect"),
                     "url": mask_url(ds["url"]),
                     "description": ds.get("description"),
@@ -229,7 +259,7 @@ class OntologyService:
     # ============================================================== datasources
     def add_datasource(
         self, name: str, url: str, description: str | None = None, schemas: list[str] | None = None, scan: bool = True,
-        tables: list[str] | None = None,
+        tables: list[str] | None = None, config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.settings.allow_datasource_tools:
             raise OntologyError("Adding datasources over MCP is disabled on this server (AUTO_ONTOLOGY_ALLOW_DATASOURCE_TOOLS=0).")
@@ -238,11 +268,18 @@ class OntologyService:
         # The name becomes a directory name under the wiki export, so no path separators.
         if not name or len(name) > 64 or "/" in name or "\\" in name or "\0" in name or name in (".", ".."):
             raise OntologyError("Give the datasource a short name (1-64 characters, no path separators).")
+
+        # MongoDB and API collections have no SQL; they are fetched into a local SQLite mirror
+        # (mirror.py) and the whole pipeline then runs on the mirror. The original source URL is
+        # kept only as the connection string; it never reaches SQLAlchemy.
+        existing = self.store.datasource_by_name(name)
+        source_type = mirror.source_type_of(url, config)
+        if source_type != "database":
+            return self._add_document_datasource(name, url, source_type, description, scan, tables, config, existing)
         try:
             url = normalize_url(url)
         except Exception as exc:  # noqa: BLE001
             raise OntologyError(f"Not a valid SQLAlchemy URL: {short_error(exc)}") from exc
-        existing = self.store.datasource_by_name(name)
         ds = {
             "id": existing["id"] if existing else new_id("ds"),
             "name": name,
@@ -281,6 +318,127 @@ class OntologyService:
             result["next_step"] = "Call scan_datasource to read the schema."
         return result
 
+    def _add_document_datasource(
+        self, name: str, url: str, source_type: str, description: str | None, scan: bool,
+        tables: list[str] | None, config: dict[str, Any] | None, existing: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if source_type == "mongo":
+            source_config = mirror.mongo_config(url)
+        elif config is None:
+            raise OntologyError("An api:// datasource needs the endpoint config; pass it in `config`.")
+        else:
+            source_config = mirror.validate_api_config(config, name)
+        ds = {
+            "id": existing["id"] if existing else new_id("ds"),
+            "name": name,
+            "url": url if (url or "").strip() else f"api://{name}",
+            "description": description,
+            "schemas": None,
+            "table_filter": split_patterns(tables) or (existing or {}).get("table_filter") or None,
+            "created_at": existing["created_at"] if existing else now(),
+            "source_type": source_type,
+            "source_config": source_config,
+            # Re-adding keeps the current mirror until a refresh re-fetches it.
+            "mirror_url": (existing or {}).get("mirror_url"),
+            "materialized_at": (existing or {}).get("materialized_at"),
+            "dialect": None,
+        }
+        if existing:
+            self.store.update("datasource", ds["id"], {k: v for k, v in ds.items() if k != "id"})
+        else:
+            self.store.insert("datasource", ds)
+        self.store.log("datasource", ds["id"], "upsert", {"name": name, "url": mask_url(ds["url"]), "source_type": source_type})
+        result: dict[str, Any] = {
+            "datasource": name,
+            "source_type": source_type,
+            "url": mask_url(ds["url"]),
+            # The connection is not tested here: a document source is read only when its mirror
+            # is fetched, and a whole mirror fetch must not hide inside add_datasource.
+            "connected": None,
+            "mirror": str(self._mirror_path(ds)) if self._mirror_exists(ds) else None,
+        }
+        if source_type == "mongo":
+            result["database"] = source_config["database"]
+        else:
+            result["endpoints"] = [e["name"] for e in source_config["endpoints"]]
+        result["next_step"] = (
+            "Call scan_datasource (the first scan fetches the mirror) or refresh_datasource to (re-)fetch and scan it; "
+            "the fetch reads every collection or endpoint, so it can take minutes on a large source."
+        )
+        return result
+
+    def _mirror_path(self, ds: dict[str, Any]) -> Path:
+        return self.settings.home / "mirrors" / f"{ds['id']}.sqlite"
+
+    def _mirror_exists(self, ds: dict[str, Any]) -> bool:
+        return bool(ds.get("mirror_url")) and self._mirror_path(ds).exists()
+
+    def _materialize(self, ds: dict[str, Any]) -> dict[str, int]:
+        """Fetch every document from the source and rewrite the local SQLite mirror atomically."""
+        kind = ds.get("source_type")
+        cfg = ds.get("source_config") or {}
+        tf = TableFilter.parse(ds.get("table_filter"))
+        deny = cfg.get("deny")
+        if kind == "mongo":
+            client = mirror.mongo_connect(cfg["url"], self.settings.query_timeout_s)
+            try:
+                names = mirror.mongo_source_names(client, cfg["database"])
+                if tf is not None:
+                    names = [n for n in names if tf.matches("", n)]
+                builders = mirror.materialize(mirror.mongo_sources(client, cfg["database"], names), deny=deny)
+            finally:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+        elif kind == "api":
+            endpoints = [e for e in cfg.get("endpoints") or [] if tf is None or tf.matches("", e["name"])]
+            sources = mirror.api_sources({**cfg, "endpoints": endpoints}, self.settings.query_timeout_s)
+            builders = mirror.materialize(sources, deny=deny)
+        else:
+            raise OntologyError(f"{ds['name']} is not a document datasource; only MongoDB and API mirrors re-fetch.")
+        try:
+            counts = mirror.write_mirror_sqlite(self._mirror_path(ds), builders)
+        except OSError as exc:
+            raise OntologyError(f"Could not write the mirror file: {short_error(exc)}") from exc
+        self.connections.forget(ds["id"])
+        self.store.update(
+            "datasource",
+            ds["id"],
+            {"mirror_url": f"sqlite:///{self._mirror_path(ds)}", "dialect": "sqlite", "materialized_at": now()},
+        )
+        return counts
+
+    def refresh_datasource(self, datasource: str | None = None, scan: bool = True) -> dict[str, Any]:
+        """Re-fetch a MongoDB / API-collection source into its SQLite mirror, then re-scan it."""
+        ds = self.ds(datasource)
+        if ds.get("source_type") not in ("mongo", "api"):
+            raise OntologyError(
+                f"'{ds['name']}' is a live SQL database ({mask_url(ds['url'])}); use scan_datasource to re-read it."
+            )
+        try:
+            counts = self._materialize(ds)
+        except OntologyError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - driver errors read as transport noise
+            raise OntologyError(
+                f"Could not fetch the {ds['source_type']} mirror for '{ds['name']}': {short_error(exc)}. "
+                "The source is unreachable or the credentials/URL are wrong."
+            ) from exc
+        ds = self.ds(ds["name"])
+        result: dict[str, Any] = {
+            "datasource": ds["name"],
+            "source_type": ds["source_type"],
+            "materialized_at": ds["materialized_at"],
+            "tables": counts,
+            "rows": sum(counts.values()),
+        }
+        if scan:
+            result["scan"] = self.scan_datasource(ds["name"])
+            result["next_step"] = result["scan"].get("next_step", "Review proposed relationships and model new tables.")
+        else:
+            result["next_step"] = "Call scan_datasource to refresh the catalog and profiles."
+        return result
+
     def _table_filter(self, ds: dict[str, Any], tables: list[str] | None) -> tuple[TableFilter | None, str | None]:
         """The scan's table filter and where it came from: the call, the datasource or the environment."""
         if ds["name"] == KNOWLEDGE_DS:
@@ -295,6 +453,19 @@ class OntologyService:
         tables: list[str] | None = None,
     ) -> dict[str, Any]:
         ds = self.ds(datasource)
+        if ds.get("source_type") in ("mongo", "api") and not self._mirror_exists(ds):
+            # First scan of a document source: fetch the mirror, then re-read the row so the
+            # catalog scan below runs against the new mirror_url/dialect.
+            try:
+                self._materialize(ds)
+            except OntologyError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - driver errors read as transport noise
+                raise OntologyError(
+                    f"Could not fetch the {ds['source_type']} mirror for '{ds['name']}': {short_error(exc)}. "
+                    "The source is unreachable or the credentials/URL are wrong."
+                ) from exc
+            ds = self.ds(ds["name"])
         table_filter, filter_source = self._table_filter(ds, tables)
         summary = self.scanner.scan(ds, schemas=schemas, profile=profile, tables=table_filter)
         if table_filter is not None:

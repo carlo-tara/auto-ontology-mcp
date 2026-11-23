@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS datasource (
     description TEXT,
     schemas TEXT,
     table_filter TEXT,
+    source_type TEXT,
+    source_config TEXT,
+    mirror_url TEXT,
+    materialized_at TEXT,
     created_at TEXT NOT NULL,
     scanned_at TEXT
 );
@@ -203,12 +207,16 @@ CREATE INDEX IF NOT EXISTS idx_rel_target ON relationship (target_column_id);
 CREATE INDEX IF NOT EXISTS idx_term_table ON term (primary_table_id);
 """
 
-JSON_FIELDS = {"schemas", "table_filter", "pk", "sample_values", "evidence", "synonyms", "validation", "terms", "detail", "spec"}
+JSON_FIELDS = {"schemas", "table_filter", "source_config", "pk", "sample_values", "evidence", "synonyms", "validation", "terms", "detail", "spec"}
 
 # Columns added after the first release; ALTER TABLE brings older stores up to date.
 _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "datasource": [
         ("table_filter", "TEXT"),
+        ("source_type", "TEXT"),
+        ("source_config", "TEXT"),
+        ("mirror_url", "TEXT"),
+        ("materialized_at", "TEXT"),
     ],
     "catalog_column": [
         ("list_separator", "TEXT"),

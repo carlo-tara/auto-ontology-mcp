@@ -374,10 +374,43 @@ You can also give the model a URL and let it call `add_datasource`. Any SQLAlche
 | MySQL / MariaDB | `mysql+pymysql://user:pass@host:3306/db` | `pymysql` |
 | DuckDB | `duckdb:////absolute/path/file.duckdb` | `duckdb-engine` |
 | Oracle | `oracle+oracledb://user:pass@host:1521/?service_name=ORCLPDB1` | `oracledb` |
+| MongoDB (mirrored) | `mongodb://user:pass@host:27017/db` or `mongodb+srv://…` | `pymongo` |
+| HTTP API collections (mirrored) | `api://<name>` + endpoint config | `httpx` (built in) |
 
-From a clone, `uv sync --extra postgres` (or `mysql`, `duckdb`, `oracle`, `all`) installs the same drivers.
+From a clone, `uv sync --extra postgres` (or `mysql`, `duckdb`, `oracle`, `mongo`, `all`) installs the same drivers.
 
 The test suite runs against SQLite and PostgreSQL 17, and against Oracle when `AO_TEST_ORACLE_URL` is set. MySQL and DuckDB go through the same SQLAlchemy and sqlglot code paths but have not been tested against a live server yet.
+
+### MongoDB and API collections: document sources as mirrors
+
+MongoDB and REST APIs speak no SQL, so Auto Ontology does not query them live. It **mirrors** them: the first scan (or `refresh_datasource`) reads every collection or endpoint, flattens the documents into tables and writes them to a local SQLite file in `~/.auto-ontology-mcp/mirrors/`, and from there the entire ordinary pipeline applies — schema scan, profiling, join inference, `validate_sql`, read-only `run_sql` — against the mirror, never against the source. The source is read with a plain connection (Mongo cursor or HTTP GET), nothing is ever written to it.
+
+```bash
+auto-ontology-mcp add orders "mongodb://readonly:pass@cluster0.mongodb/ordersdb" --tables "users,transactions,!logs*"
+auto-ontology-mcp add crm api://crm --config crm-endpoints.json
+auto-ontology-mcp refresh orders          # re-fetch the snapshot (mirrors do not update themselves)
+```
+
+`crm-endpoints.json`:
+
+```json
+{
+  "base_url": "https://api.example.com/v1",
+  "headers": {"Authorization": "env:HUBSPOT_TOKEN"},
+  "endpoints": [
+    {"name": "deals", "path": "/deals", "items_path": "results",
+     "pagination": {"type": "cursor", "next_path": "paging.after"}},
+    {"name": "companies", "path": "/companies", "items_path": "results",
+     "pagination": {"type": "page", "param": "offset", "size_param": "limit", "size": 100}}
+  ]
+}
+```
+
+- **Flattening is deterministic.** `_id` becomes the TEXT primary key `id` (ObjectId as its hex string); scalars keep their kind; dates become ISO 8601 text; nested objects and scalar arrays become JSON text, queryable with SQLite's `json_extract`; an array of documents becomes a child table `parent__field` with `parent_id` and `_idx`, so the one-to-many join the array carries is visible to the ontology. Key names are sanitized to `[A-Za-z0-9_]`.
+- **Credential-shaped fields are dropped by name** (`password`, `token`, `secret`, … — the full list in `mirror.DEFAULT_DENY`); `config["deny"]` extends it. Secrets in the config itself never need to be stored: header values written as `"env:VAR"` are read from the environment when the fetch runs.
+- **A mirror is a snapshot.** `check_readiness` reports `materialized_at` and says `not_materialized` until the first fetch. Refresh it on your own schedule (`cron`, CI, or before an analysis); answers reflect the data at fetch time, which is the same limitation you accept with any warehouse extract.
+- **Filters apply before the fetch.** The table patterns (above) select which collections or endpoints to mirror, so a large or noisy collection never leaves the source.
+- **Polymorphic references and multi-key joins** are not inferred from BSON references: model them the way you would in any database, with `set_relationship` after reviewing samples (the value-containment probe still proposes candidate joins on the mirror's data).
 
 ### Large schemas
 
@@ -564,7 +597,7 @@ Reading the photo is up to the agent's model, so use one that accepts images. Th
 | Stage | Tools |
 | --- | --- |
 | Status | `check_readiness` |
-| Connect and scan | `add_datasource`, `scan_datasource` |
+| Connect and scan | `add_datasource`, `scan_datasource`, `refresh_datasource` |
 | Model | `get_modeling_worklist`, `save_table_terms`, `update_term`, `save_glossary` |
 | Relationships | `list_relationships`, `set_relationship`, `find_join_path` |
 | SQL attributes | `suggest_sql_attributes`, `save_sql_attribute` |
